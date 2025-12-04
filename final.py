@@ -58,8 +58,33 @@ def generate_data():
     x_l, y_l = -ones, vals
     x_t, y_t = vals, ones
     x_b, y_b = vals, -ones
-
+    
     return x, y, x_t, y_t, x_b, y_b, x_l, y_l, x_r, y_r
+
+print("Plotting data point distribution...")
+# 生成一批資料
+x, y, x_t, y_t, x_b, y_b, x_l, y_l, x_r, y_r = generate_data()
+    
+plt.figure(figsize=(8, 8))
+    
+# 1. 畫內部點 (Domain Points) - 藍色點
+plt.scatter(x.numpy(), y.numpy(), c='blue', s=1, alpha=0.5, label='Interior Domain')
+    
+# 2. 畫邊界點 (Boundary Points) - 紅色點
+# 為了看清楚，我們把四個邊的點合併畫
+x_bound = tf.concat([x_t, x_b, x_l, x_r], axis=0)
+y_bound = tf.concat([y_t, y_b, y_l, y_r], axis=0)
+plt.scatter(x_bound.numpy(), y_bound.numpy(), c='red', s=1, label='Boundaries')
+    
+plt.title(f"Data Distribution\n(Interior: {len(x)}, Boundary: {len(x_bound)})")
+plt.xlabel("x")
+plt.ylabel("y")
+plt.legend(loc='upper right')
+plt.xlim(-1.1, 1.1)
+plt.ylim(-1.1, 1.1)
+plt.grid(True, linestyle='--', alpha=0.3)
+plt.savefig("data_distribution.png", dpi=300)
+plt.close()
 
 # =================================
 # 4. Physics Helper Functions
@@ -256,180 +281,141 @@ mae_t = tf.reduce_mean(tf.abs(res_t_val))
 print(f"Validation Thermal PDE Error: Mean={mae_t:.2e}")
 
 # =================================
-# 8. Advanced Visualization
+# 8. Advanced Visualization (最終修復版)
 # =================================
 print("Generating Advanced Visualization Plots...")
 
-# --- 準備繪圖資料 ---
+# --- 1. 準備繪圖資料 ---
 n_grid = 400
 x_vals = np.linspace(-1, 1, n_grid)
 y_vals = np.linspace(-1, 1, n_grid)
-# 產生 2D 網格 (400, 400)
 X_grid, Y_grid = np.meshgrid(x_vals, y_vals)
 
-# 準備給神經網路預測用的扁平輸入 (160000, 1)
-x_flat_np = X_grid.flatten()[:, None]
-y_flat_np = Y_grid.flatten()[:, None]
-x_tf = tf.cast(x_flat_np, DTYPE)
-y_tf = tf.cast(y_flat_np, DTYPE)
+# [關鍵修正] 準備給 TF 的輸入，必須是 (N, 1)
+# 但後續計算全部轉回 (N,) 一維陣列以避免廣播錯誤
+x_flat_input = tf.cast(X_grid.flatten()[:, None], DTYPE)
+y_flat_input = tf.cast(Y_grid.flatten()[:, None], DTYPE)
 
-# 1. 預測基礎物理量 (phi, T)
-# model 需要扁平輸入 (N, 2)
-out = model(tf.concat([x_tf, y_tf], axis=1))
-phi_pred_flat = out[:, 0].numpy()
-T_raw_flat = out[:, 1].numpy()
+# --- 2. 預測與物理量計算 ---
+# Model Prediction
+out = model(tf.concat([x_flat_input, y_flat_input], axis=1))
 
-# 應用 Hard Constraint
-dist_flat = (1 - x_flat_np**2) * (1 - y_flat_np**2)
+# [關鍵修正] 全部強制壓扁成 1D array (N,)
+phi_pred_flat = out[:, 0].numpy().flatten()
+T_raw_flat = out[:, 1].numpy().flatten()
+x_flat = X_grid.flatten()
+y_flat = Y_grid.flatten()
+
+# 應用 Hard Constraint (現在大家都是 1D，相乘絕對安全)
+dist_flat = (1 - x_flat**2) * (1 - y_flat**2)
 T_pred_flat = T_raw_flat * dist_flat
 
-# 重塑回 (400, 400)
+# 重塑回 2D 網格 (400, 400)
 phi_grid = phi_pred_flat.reshape(n_grid, n_grid)
 T_grid = T_pred_flat.reshape(n_grid, n_grid)
 
-# 2. 計算衍生物理量
 # 計算梯度
 dy = dx = 2.0 / (n_grid - 1)
 grad_phi_y, grad_phi_x = np.gradient(phi_grid, dy, dx)
 grad_T_y, grad_T_x = np.gradient(T_grid, dy, dx)
 
-# 電流密度 J
+# 計算電流與熱源
 Jx_grid = -SIGMA_ELEC * grad_phi_x
 Jy_grid = -SIGMA_ELEC * grad_phi_y
 J_mag_grid = np.sqrt(Jx_grid**2 + Jy_grid**2)
-
-# 焦耳熱 Q_joule
 Q_joule_grid = (1.0 / SIGMA_ELEC) * J_mag_grid**2
 
-# --- [關鍵修正] 計算邏輯熱 Q_logic ---
-# 直接傳入 (400, 400) 的網格，不要傳入扁平向量
-# 這樣 TF 會直接輸出 (400, 400)，不需要 reshape，也不會發生廣播錯誤
-Q_logic_tf = get_chip_layout_heat(X_grid, Y_grid) 
-Q_logic_grid = Q_logic_tf.numpy() # 確保轉回 numpy
-
-# 總熱源
+# 計算邏輯熱 (直接用 meshgrid 計算，避免維度問題)
+Q_logic_tf = get_chip_layout_heat(X_grid, Y_grid)
+Q_logic_grid = Q_logic_tf.numpy()
 Q_total_grid = Q_joule_grid + Q_logic_grid
 
-# 熱通量 q
+# 熱通量
 qx_grid = -K_THERM * grad_T_x
 qy_grid = -K_THERM * grad_T_y
 
-# -------------------------------------------------
+# --- 3. 開始繪圖 ---
+
 # Figure 1: Training Diagnostics
-# -------------------------------------------------
-fig1, ax1 = plt.subplots(1, 2, figsize=(14, 5))
-epochs_idx = np.arange(len(history['total'])) * 10 # 假設每 10 epoch 存一次
+# 檢查 history 是否為空
+if len(history['total']) > 0:
+    fig1, ax1 = plt.subplots(1, 2, figsize=(14, 5))
+    steps_per_record = 10 
+    epochs_idx = np.arange(len(history['total'])) * steps_per_record
 
-# Loss History
-ax1[0].semilogy(epochs_idx, history['total'], 'k-', label='Total', linewidth=2)
-ax1[0].semilogy(epochs_idx, history['elec'], 'b--', label='Elec')
-ax1[0].semilogy(epochs_idx, history['therm'], 'r--', label='Therm')
-ax1[0].semilogy(epochs_idx, history['glob'], 'g:', label='Global')
-ax1[0].semilogy(epochs_idx, history['bc'], 'c:', label='BC')
-ax1[0].axvline(x=EPOCHS_PHASE_1, color='gray', linestyle='--')
-ax1[0].axvline(x=EPOCHS_PHASE_1+EPOCHS_PHASE_2, color='gray', linestyle='--')
-ax1[0].set_xlabel('Epochs')
-ax1[0].set_ylabel('Loss (Log Scale)')
-ax1[0].set_title('Training Diagnostics: Loss History')
-ax1[0].legend()
-ax1[0].grid(True, which='both', linestyle='--', linewidth=0.5)
+    ax1[0].semilogy(epochs_idx, history['total'], 'k-', label='Total')
+    ax1[0].semilogy(epochs_idx, history['elec'], 'b--', label='Elec')
+    ax1[0].semilogy(epochs_idx, history['therm'], 'r--', label='Therm')
+    ax1[0].semilogy(epochs_idx, history['glob'], 'g:', label='Global')
+    ax1[0].axvline(x=EPOCHS_PHASE_1, color='gray', linestyle='--')
+    ax1[0].axvline(x=EPOCHS_PHASE_1+EPOCHS_PHASE_2, color='gray', linestyle='--')
+    ax1[0].set_title('Loss History')
+    ax1[0].legend()
+    ax1[0].grid(True, linestyle='--', alpha=0.5)
 
-# Conservation Check
-ax1[1].plot(epochs_idx, history['gen_val'], 'r-', label='Total Heat Gen')
-ax1[1].plot(epochs_idx, history['flux_val'], 'b--', label='Total Flux Out')
-ax1[1].axvline(x=EPOCHS_PHASE_1, color='gray', linestyle='--')
-ax1[1].axvline(x=EPOCHS_PHASE_1+EPOCHS_PHASE_2, color='gray', linestyle='--')
-ax1[1].set_xlabel('Epochs')
-ax1[1].set_ylabel('Power (W)')
-ax1[1].set_title('Global Energy Balance Check')
-ax1[1].legend()
-ax1[1].grid(True)
+    ax1[1].plot(epochs_idx, history['gen_val'], 'r-', label='Gen (Input)')
+    ax1[1].plot(epochs_idx, history['flux_val'], 'b--', label='Flux (Output)')
+    ax1[1].axvline(x=EPOCHS_PHASE_1, color='gray', linestyle='--')
+    ax1[1].axvline(x=EPOCHS_PHASE_1+EPOCHS_PHASE_2, color='gray', linestyle='--')
+    ax1[1].set_title('Global Energy Conservation')
+    ax1[1].legend()
+    ax1[1].grid(True)
+    
+    plt.tight_layout()
+    plt.savefig('1_training_diagnostics.png', dpi=300)
+    plt.close()
 
-plt.tight_layout()
-plt.savefig('1_training_diagnostics.png', dpi=300)
-plt.show()
-plt.close() # 釋放記憶體
-
-# -------------------------------------------------
 # Figure 2: Multi-Physics Analysis
-# -------------------------------------------------
 fig2, ax2 = plt.subplots(1, 3, figsize=(20, 5))
 
-# C. Potential & Current
+# Potential & Current
 c1 = ax2[0].contourf(X_grid, Y_grid, phi_grid, 50, cmap='plasma')
 plt.colorbar(c1, ax=ax2[0], label='Potential (V)')
-# Streamplot 密度調整
-ax2[0].streamplot(X_grid, Y_grid, Jx_grid, Jy_grid, color='white', linewidth=0.8, density=1.0, arrowsize=1.0)
-ax2[0].set_title('C. Electric Potential & Current Flow (J)')
-ax2[0].set_aspect('equal')
+ax2[0].streamplot(X_grid, Y_grid, Jx_grid, Jy_grid, color='white', linewidth=0.8, density=1.0)
+ax2[0].set_title('Potential & Current Flow')
 
-# D. Total Heat Source
+# Heat Source
 c2 = ax2[1].contourf(X_grid, Y_grid, Q_total_grid, 50, cmap='inferno')
-plt.colorbar(c2, ax=ax2[1], label='W/m^3')
-ax2[1].set_title('D. Total Heat Source (Logic + Joule)')
-ax2[1].set_aspect('equal')
+plt.colorbar(c2, ax=ax2[1], label='Heat Source')
+ax2[1].set_title('Total Heat Source')
 
-# E. Temp & Heat Flux
+# Temp & Flux
 c3 = ax2[2].contourf(X_grid, Y_grid, T_grid, 50, cmap='turbo')
-plt.colorbar(c3, ax=ax2[2], label='Temperature (K)')
-# Quiver 採樣調整
+plt.colorbar(c3, ax=ax2[2], label='Temp (K)')
 skip = 25
 ax2[2].quiver(X_grid[::skip, ::skip], Y_grid[::skip, ::skip], 
               qx_grid[::skip, ::skip], qy_grid[::skip, ::skip], 
               color='black', scale=500, width=0.005)
-ax2[2].set_title('E. Temperature & Heat Flux Vectors (q)')
-ax2[2].set_aspect('equal')
+ax2[2].set_title('Temperature & Flux')
 
 plt.tight_layout()
 plt.savefig('2_multiphysics_analysis.png', dpi=300)
-plt.show()
 plt.close()
 
-# -------------------------------------------------
-# Figure 3: 1D Slice Analysis
-# -------------------------------------------------
-mid_idx = n_grid // 2
-x_slice = X_grid[mid_idx, :]
-phi_slice = phi_grid[mid_idx, :]
-T_slice = T_grid[mid_idx, :]
-J_mag_slice = J_mag_grid[mid_idx, :]
-Q_total_slice = Q_total_grid[mid_idx, :]
-
+# Figure 3: 1D Slices
+mid = n_grid // 2
 fig3, ax3 = plt.subplots(1, 2, figsize=(14, 5))
 
-# F. Electrical Slice
-ax3[0].plot(x_slice, phi_slice, 'b-', label='Potential', linewidth=2)
-ax3[0].set_xlabel('x (at y=0)')
-ax3[0].set_ylabel('Potential (V)')
-ax3[0].set_title('F. 1D Slice: Electrical (y=0)')
-ax3[0].grid(True)
+# Elec Slice
+ax3[0].plot(x_vals, phi_grid[mid, :], 'b-', label='Phi')
+ax3[0].set_ylabel('Potential')
 ax3_twin = ax3[0].twinx()
-ax3_twin.plot(x_slice, J_mag_slice, 'r--', label='|J|')
+ax3_twin.plot(x_vals, J_mag_grid[mid, :], 'r--', label='|J|')
 ax3_twin.set_ylabel('|J|', color='r')
-ax3_twin.tick_params(axis='y', labelcolor='r')
-# 合併圖例
-l1, lab1 = ax3[0].get_legend_handles_labels()
-l2, lab2 = ax3_twin.get_legend_handles_labels()
-ax3[0].legend(l1+l2, lab1+lab2, loc='upper right')
+ax3[0].set_title('1D Slice: Electrical (y=0)')
+ax3[0].grid(True)
 
-# G. Thermal Slice
-ax3[1].plot(x_slice, T_slice, 'k-', label='Temp', linewidth=2)
-ax3[1].set_xlabel('x (at y=0)')
-ax3[1].set_ylabel('Temperature (K)')
-ax3[1].set_title('G. 1D Slice: Thermal (y=0)')
-ax3[1].grid(True)
+# Therm Slice
+ax3[1].plot(x_vals, T_grid[mid, :], 'k-', label='Temp')
+ax3[1].set_ylabel('Temp')
 ax3_twin2 = ax3[1].twinx()
-ax3_twin2.plot(x_slice, Q_total_slice, 'm:', label='Q Source')
-ax3_twin2.set_ylabel('Heat Source Q', color='m')
-ax3_twin2.tick_params(axis='y', labelcolor='m')
-# 合併圖例
-l3, lab3 = ax3[1].get_legend_handles_labels()
-l4, lab4 = ax3_twin2.get_legend_handles_labels()
-ax3[1].legend(l3+l4, lab3+lab4, loc='upper right')
+ax3_twin2.plot(x_vals, Q_total_grid[mid, :], 'm:', label='Q')
+ax3_twin2.set_ylabel('Heat Source', color='m')
+ax3[1].set_title('1D Slice: Thermal (y=0)')
+ax3[1].grid(True)
 
 plt.tight_layout()
 plt.savefig('3_quantitative_slices.png', dpi=300)
-plt.show()
 plt.close()
 
 print("All plots saved successfully.")
